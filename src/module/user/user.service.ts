@@ -6,7 +6,7 @@ export interface CreateUserData {
   name: string;
   email: string;
   password: string;
-  emailVerificationToken: string;
+  emailVerificationCode: string;
   emailVerificationExpires: Date;
 }
 
@@ -30,39 +30,39 @@ export class UserService {
     return this.prisma.user.create({ data });
   }
 
-  updateEmailVerification(userId: string): Promise<User> {
+  markEmailVerified(userId: string): Promise<User> {
     return this.prisma.user.update({
       where: { id: userId },
       data: {
         isEmailVerified: true,
-        emailVerificationToken: null,
+        emailVerificationCode: null,
         emailVerificationExpires: null,
       },
     });
   }
 
-  setEmailVerificationToken(
+  setEmailVerificationCode(
     userId: string,
-    token: string,
+    code: string,
     expires: Date,
   ): Promise<User> {
     return this.prisma.user.update({
       where: { id: userId },
       data: {
-        emailVerificationToken: token,
+        emailVerificationCode: code,
         emailVerificationExpires: expires,
       },
     });
   }
 
-  setPasswordResetToken(
+  setPasswordResetCode(
     userId: string,
-    token: string,
+    code: string,
     expires: Date,
   ): Promise<User> {
     return this.prisma.user.update({
       where: { id: userId },
-      data: { passwordResetToken: token, passwordResetExpires: expires },
+      data: { passwordResetCode: code, passwordResetExpires: expires },
     });
   }
 
@@ -71,27 +71,9 @@ export class UserService {
       where: { id: userId },
       data: {
         password: hashedPassword,
-        passwordResetToken: null,
+        passwordResetCode: null,
         passwordResetExpires: null,
       },
     });
-  }
-
-  async findByEmailVerificationToken(token: string): Promise<User | null> {
-    const user = await this.prisma.user.findUnique({
-      where: { emailVerificationToken: token },
-    });
-    if (!user || !user.emailVerificationExpires) return null;
-    if (user.emailVerificationExpires < new Date()) return null;
-    return user;
-  }
-
-  async findByPasswordResetToken(token: string): Promise<User | null> {
-    const user = await this.prisma.user.findUnique({
-      where: { passwordResetToken: token },
-    });
-    if (!user || !user.passwordResetExpires) return null;
-    if (user.passwordResetExpires < new Date()) return null;
-    return user;
   }
 }

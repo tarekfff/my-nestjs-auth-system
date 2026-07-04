@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Post, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { Public } from '../../common/decorators/public.decorator';
@@ -21,7 +21,7 @@ export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   @ApiOperation({
-    summary: 'Register a new account and send a verification email',
+    summary: 'Register a new account and email a 6-digit verification code',
   })
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @Public()
@@ -31,16 +31,16 @@ export class AuthController {
   }
 
   @ApiOperation({
-    summary:
-      'Verify an email address using the token from the verification email',
+    summary: 'Verify an email address with the 6-digit code sent by email',
   })
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @Public()
-  @Get('verify-email')
-  verifyEmail(@Query() query: VerifyEmailDto) {
-    return this.authService.verifyEmail(query.token);
+  @Post('verify-email')
+  verifyEmail(@Body() dto: VerifyEmailDto) {
+    return this.authService.verifyEmail(dto);
   }
 
-  @ApiOperation({ summary: 'Resend the email verification link' })
+  @ApiOperation({ summary: 'Resend the email verification code' })
   @Throttle({ default: { limit: 3, ttl: 60_000 } })
   @Public()
   @Post('resend-verification')
@@ -91,7 +91,7 @@ export class AuthController {
     return this.authService.logoutAll(user.id);
   }
 
-  @ApiOperation({ summary: 'Request a password reset email' })
+  @ApiOperation({ summary: 'Email a 6-digit password reset code' })
   @Throttle({ default: { limit: 3, ttl: 60_000 } })
   @Public()
   @Post('forgot-password')
@@ -100,7 +100,7 @@ export class AuthController {
   }
 
   @ApiOperation({
-    summary: 'Reset the password using the token from the reset email',
+    summary: 'Reset the password with the 6-digit code sent by email',
   })
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @Public()

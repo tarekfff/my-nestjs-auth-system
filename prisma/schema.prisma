@@ -20,19 +20,16 @@ model User {
   role     Role   @default(USER)
 
   isEmailVerified          Boolean   @default(false)
-  emailVerificationToken   String?   @unique
+  emailVerificationCode    String?
   emailVerificationExpires DateTime?
 
-  passwordResetToken   String?   @unique
+  passwordResetCode    String?
   passwordResetExpires DateTime?
 
   refreshTokens RefreshToken[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
-  @@index([emailVerificationToken])
-  @@index([passwordResetToken])
 }
 
 model RefreshToken {

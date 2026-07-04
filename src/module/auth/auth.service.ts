@@ -9,7 +9,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { User } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
-import { randomBytes } from 'crypto';
+import { randomBytes, randomInt } from 'crypto';
 import { PrismaService } from '../../lib/database/prisma.service';
 import { MailService } from '../../lib/mail/mail.service';
 import { UserService } from '../user/user.service';
@@ -19,17 +19,20 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import { ResendVerificationDto } from './dto/resend-verification.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { VerifyEmailDto } from './dto/verify-email.dto';
 import { RefreshTokenPayload } from './types/jwt-payload.interface';
 
-const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
-const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
+const EMAIL_VERIFICATION_TTL_MS = 15 * 60 * 1000;
+const PASSWORD_RESET_TTL_MS = 15 * 60 * 1000;
 const GENERIC_MESSAGE = {
   message: 'If that account exists, an email was sent.',
 };
 
 export interface TokenPair {
   accessToken: string;
+  accessTokenExpiresAt: string;
   refreshToken: string;
+  refreshTokenExpiresAt: string;
 }
 
 @Injectable()
@@ -42,14 +45,16 @@ export class AuthService {
     private readonly configService: ConfigService,
   ) {}
 
-  async register(dto: RegisterDto): Promise<UserEntity> {
+  async register(
+    dto: RegisterDto,
+  ): Promise<{ user: UserEntity; message: string }> {
     const existing = await this.userService.findByEmail(dto.email);
     if (existing) {
       throw new ConflictException('An account with this email already exists');
     }
 
     const hashedPassword = await bcrypt.hash(dto.password, 10);
-    const emailVerificationToken = randomBytes(32).toString('hex');
+    const emailVerificationCode = this.generateOtp();
     const emailVerificationExpires = new Date(
       Date.now() + EMAIL_VERIFICATION_TTL_MS,
     );
@@ -58,16 +63,50 @@ export class AuthService {
       name: dto.name,
       email: dto.email,
       password: hashedPassword,
-      emailVerificationToken,
+      emailVerificationCode,
       emailVerificationExpires,
     });
 
     await this.mailService.sendVerificationEmail(
       user.email,
-      emailVerificationToken,
+      emailVerificationCode,
     );
 
-    return new UserEntity(user);
+    return {
+      user: new UserEntity(user),
+      message:
+        'Account created. Enter the 6-digit code we sent to your email to verify your account.',
+    };
+  }
+
+  async verifyEmail(dto: VerifyEmailDto): Promise<{ message: string }> {
+    const user = await this.userService.findByEmail(dto.email);
+    if (
+      !user ||
+      user.isEmailVerified ||
+      !user.emailVerificationCode ||
+      !user.emailVerificationExpires ||
+      user.emailVerificationExpires < new Date() ||
+      user.emailVerificationCode !== dto.code
+    ) {
+      throw new BadRequestException('Invalid or expired code');
+    }
+
+    await this.userService.markEmailVerified(user.id);
+    return { message: 'Email verified. You can now log in.' };
+  }
+
+  async resendVerification(
+    dto: ResendVerificationDto,
+  ): Promise<{ message: string }> {
+    const user = await this.userService.findByEmail(dto.email);
+    if (user && !user.isEmailVerified) {
+      const code = this.generateOtp();
+      const expires = new Date(Date.now() + EMAIL_VERIFICATION_TTL_MS);
+      await this.userService.setEmailVerificationCode(user.id, code, expires);
+      await this.mailService.sendVerificationEmail(user.email, code);
+    }
+    return GENERIC_MESSAGE;
   }
 
   async login(dto: LoginDto): Promise<TokenPair & { user: UserEntity }> {
@@ -84,7 +123,9 @@ export class AuthService {
     return { ...tokens, user: new UserEntity(user) };
   }
 
-  async refresh(payload: RefreshTokenPayload): Promise<TokenPair> {
+  async refresh(
+    payload: RefreshTokenPayload,
+  ): Promise<TokenPair & { user: UserEntity }> {
     const tokenRow = await this.prisma.refreshToken.findUnique({
       where: { id: payload.jti },
     });
@@ -117,7 +158,8 @@ export class AuthService {
       data: { revoked: true },
     });
 
-    return this.issueTokenPair(user);
+    const tokens = await this.issueTokenPair(user);
+    return { ...tokens, user: new UserEntity(user) };
   }
 
   async logout(refreshToken: string): Promise<{ message: string }> {
@@ -144,43 +186,27 @@ export class AuthService {
     return { message: 'All sessions revoked' };
   }
 
-  async verifyEmail(token: string): Promise<{ message: string }> {
-    const user = await this.userService.findByEmailVerificationToken(token);
-    if (!user) {
-      throw new BadRequestException('Invalid or expired token');
-    }
-    await this.userService.updateEmailVerification(user.id);
-    return { message: 'Email verified' };
-  }
-
-  async resendVerification(
-    dto: ResendVerificationDto,
-  ): Promise<{ message: string }> {
-    const user = await this.userService.findByEmail(dto.email);
-    if (user && !user.isEmailVerified) {
-      const token = randomBytes(32).toString('hex');
-      const expires = new Date(Date.now() + EMAIL_VERIFICATION_TTL_MS);
-      await this.userService.setEmailVerificationToken(user.id, token, expires);
-      await this.mailService.sendVerificationEmail(user.email, token);
-    }
-    return GENERIC_MESSAGE;
-  }
-
   async forgotPassword(dto: ForgotPasswordDto): Promise<{ message: string }> {
     const user = await this.userService.findByEmail(dto.email);
     if (user) {
-      const token = randomBytes(32).toString('hex');
+      const code = this.generateOtp();
       const expires = new Date(Date.now() + PASSWORD_RESET_TTL_MS);
-      await this.userService.setPasswordResetToken(user.id, token, expires);
-      await this.mailService.sendPasswordResetEmail(user.email, token);
+      await this.userService.setPasswordResetCode(user.id, code, expires);
+      await this.mailService.sendPasswordResetEmail(user.email, code);
     }
     return GENERIC_MESSAGE;
   }
 
   async resetPassword(dto: ResetPasswordDto): Promise<{ message: string }> {
-    const user = await this.userService.findByPasswordResetToken(dto.token);
-    if (!user) {
-      throw new BadRequestException('Invalid or expired token');
+    const user = await this.userService.findByEmail(dto.email);
+    if (
+      !user ||
+      !user.passwordResetCode ||
+      !user.passwordResetExpires ||
+      user.passwordResetExpires < new Date() ||
+      user.passwordResetCode !== dto.code
+    ) {
+      throw new BadRequestException('Invalid or expired code');
     }
 
     const hashedPassword = await bcrypt.hash(dto.newPassword, 10);
@@ -188,6 +214,10 @@ export class AuthService {
     await this.logoutAll(user.id);
 
     return { message: 'Password reset successfully' };
+  }
+
+  private generateOtp(): string {
+    return randomInt(0, 1_000_000).toString().padStart(6, '0');
   }
 
   private async issueTokenPair(user: User): Promise<TokenPair> {
@@ -199,12 +229,15 @@ export class AuthService {
     const accessExpiresInMs = this.parseExpiresInMs(
       this.configService.get<string>('JWT_ACCESS_EXPIRES_IN')!,
     );
+    const now = Date.now();
+    const accessTokenExpiresAt = new Date(now + accessExpiresInMs);
+    const refreshTokenExpiresAt = new Date(now + refreshExpiresInMs);
 
     const tokenRow = await this.prisma.refreshToken.create({
       data: {
         userId: user.id,
         hashedToken,
-        expiresAt: new Date(Date.now() + refreshExpiresInMs),
+        expiresAt: refreshTokenExpiresAt,
       },
     });
 
@@ -224,7 +257,12 @@ export class AuthService {
       },
     );
 
-    return { accessToken, refreshToken };
+    return {
+      accessToken,
+      accessTokenExpiresAt: accessTokenExpiresAt.toISOString(),
+      refreshToken,
+      refreshTokenExpiresAt: refreshTokenExpiresAt.toISOString(),
+    };
   }
 
   private parseExpiresInMs(value: string): number {

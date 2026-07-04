@@ -14,13 +14,13 @@ export class UserEntity {
   password: string;
 
   @Exclude()
-  emailVerificationToken: string | null;
+  emailVerificationCode: string | null;
 
   @Exclude()
   emailVerificationExpires: Date | null;
 
   @Exclude()
-  passwordResetToken: string | null;
+  passwordResetCode: string | null;
 
   @Exclude()
   passwordResetExpires: Date | null;
