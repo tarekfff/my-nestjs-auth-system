@@ -1,18 +1,18 @@
 import { Body, Controller, Post, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { Public } from '../../common/decorators/public.decorator';
+import { AllowMustChangePassword } from '../../common/decorators/allow-must-change-password.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { Public } from '../../common/decorators/public.decorator';
 import { JwtRefreshGuard } from '../../common/guards/jwt-refresh.guard';
 import type { RequestUser } from '../../common/types/request-user.interface';
 import { AuthService } from './auth.service';
+import { ActivateDto } from './dto/activate.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { LoginDto } from './dto/login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
-import { RegisterDto } from './dto/register.dto';
-import { ResendVerificationDto } from './dto/resend-verification.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
-import { VerifyEmailDto } from './dto/verify-email.dto';
 import type { RefreshTokenPayload } from './types/jwt-payload.interface';
 
 @ApiTags('auth')
@@ -21,36 +21,7 @@ export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   @ApiOperation({
-    summary: 'Register a new account and email a 6-digit verification code',
-  })
-  @Throttle({ default: { limit: 5, ttl: 60_000 } })
-  @Public()
-  @Post('register')
-  register(@Body() dto: RegisterDto) {
-    return this.authService.register(dto);
-  }
-
-  @ApiOperation({
-    summary: 'Verify an email address with the 6-digit code sent by email',
-  })
-  @Throttle({ default: { limit: 5, ttl: 60_000 } })
-  @Public()
-  @Post('verify-email')
-  verifyEmail(@Body() dto: VerifyEmailDto) {
-    return this.authService.verifyEmail(dto);
-  }
-
-  @ApiOperation({ summary: 'Resend the email verification code' })
-  @Throttle({ default: { limit: 3, ttl: 60_000 } })
-  @Public()
-  @Post('resend-verification')
-  resendVerification(@Body() dto: ResendVerificationDto) {
-    return this.authService.resendVerification(dto);
-  }
-
-  @ApiOperation({
-    summary:
-      'Log in with email + password, returns an access and refresh token',
+    summary: 'Log in with email + password (CompanyUser or StaffUser)',
   })
   @Throttle({ default: { limit: 5, ttl: 60_000 } })
   @Public()
@@ -88,7 +59,28 @@ export class AuthController {
   @ApiBearerAuth()
   @Post('logout-all')
   logoutAll(@CurrentUser() user: RequestUser) {
-    return this.authService.logoutAll(user.id);
+    return this.authService.logoutAll(user);
+  }
+
+  @ApiOperation({ summary: 'Change the current user password' })
+  @ApiBearerAuth()
+  @AllowMustChangePassword()
+  @Post('change-password')
+  changePassword(
+    @CurrentUser() user: RequestUser,
+    @Body() dto: ChangePasswordDto,
+  ) {
+    return this.authService.changePassword(user, dto);
+  }
+
+  @ApiOperation({
+    summary: 'Activate a CompanyUser account with the token sent by an admin',
+  })
+  @Throttle({ default: { limit: 5, ttl: 60_000 } })
+  @Public()
+  @Post('activate')
+  activate(@Body() dto: ActivateDto) {
+    return this.authService.activate(dto);
   }
 
   @ApiOperation({ summary: 'Email a 6-digit password reset code' })

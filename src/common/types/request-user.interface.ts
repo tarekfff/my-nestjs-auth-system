@@ -1,6 +1,10 @@
-import { Role } from '@prisma/client';
+import { StaffRole } from '@prisma/client';
+
+export type UserType = 'COMPANY' | 'STAFF';
 
 export interface RequestUser {
-  id: string;
-  role: Role;
+  userId: string;
+  userType: UserType;
+  companyId?: string;
+  role?: StaffRole;
 }

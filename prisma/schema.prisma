@@ -1,3 +1,13 @@
+// ============================================================
+// OMPLEO — prisma/schema.prisma (complete platform, V2)
+// Ton auth system est intégré ici, adapté aux invariants :
+//   User → CompanyUser + StaffUser (pas de USER générique)
+//   Role {USER,ADMIN} → StaffRole {ADMIN,OPERATIONS,CLOSER}
+//   emailVerification* → activationToken/Expires (créé par l'admin)
+//   RefreshToken → conservé, relié aux deux populations
+//   passwordReset* → conservé tel quel sur les deux modèles
+// ============================================================
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -7,39 +17,761 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum Role {
-  USER
+// ==================== ENUMS ====================
+
+enum StaffRole {
   ADMIN
+  OPERATIONS
+  CLOSER
 }
 
-model User {
-  id       String @id @default(cuid())
-  email    String @unique
-  password String
-  name     String
-  role     Role   @default(USER)
+enum CompanyVerification {
+  A_VERIFIER
+  EN_COURS
+  VALIDEE
+  REFUSEE
+  SUSPENDUE
+}
 
-  isEmailVerified          Boolean   @default(false)
-  emailVerificationCode    String?
-  emailVerificationExpires DateTime?
+enum DocumentStatus {
+  RECU
+  VALIDE
+  REFUSE
+}
+
+enum LeadSource {
+  FORMULAIRE
+  WHATSAPP
+  CAMPAGNE
+  PARTENAIRE
+  CLOSER
+}
+
+enum LeadStatus {
+  NOUVEAU
+  CONTACTE
+  EN_NEGOCIATION
+  CONVERTI
+  PERDU
+}
+
+enum ContractType {
+  CDI
+  CDD
+  STAGE
+  FREELANCE
+  ALTERNANCE
+}
+
+enum WorkMode {
+  PRESENTIEL
+  HYBRIDE
+  REMOTE
+}
+
+enum ExperienceLevel {
+  DEBUTANT
+  JUNIOR
+  CONFIRME
+  SENIOR
+  EXPERT
+}
+
+enum EducationLevel {
+  NON_REQUIS
+  BAC
+  BAC2
+  BAC3
+  BAC5
+  DOCTORAT
+}
+
+enum Currency {
+  DZD
+  EUR
+  USD
+}
+
+enum Lang {
+  FR
+  AR
+  EN
+}
+
+// Cycle de vie offre (13.2) — piloté par Ompleo
+enum JobStatus {
+  BROUILLON
+  SOUMISE
+  A_COMPLETER
+  EN_REVUE
+  PLANIFIEE
+  ACTIVE
+  CLOTUREE
+  ARCHIVEE
+}
+
+enum MediaRequirement {
+  OFF
+  OPTIONAL
+  REQUIRED
+}
+
+// Statuts candidature (15.8)
+enum ApplicationStatus {
+  A_ETUDIER
+  EN_COURS_ETUDE
+  PRESELECTIONNE
+  ENTRETIEN_PREVU
+  PROCESSUS_EN_COURS
+  RECRUTE
+  NON_RETENU
+  MEDIA_A_COMPLETER
+  CLOTUREE_AUTO
+}
+
+enum MediaKind {
+  CV
+  AUDIO
+  VIDEO
+}
+
+// Statuts média (12.3)
+enum MediaStatus {
+  NON_DEMANDE
+  A_ENVOYER
+  ENVOYE
+  EN_ANALYSE
+  VALIDE
+  A_REFAIRE
+  BLOQUE
+  A_VERIFIER
+}
+
+enum JobRequestType {
+  MODIFICATION
+  PROLONGATION
+  CLOTURE_ANTICIPEE
+}
+
+enum JobRequestStatus {
+  EN_ATTENTE
+  ACCEPTEE
+  REFUSEE
+}
+
+enum MsgChannel {
+  WHATSAPP
+  EMAIL
+  SMS
+}
+
+enum MsgStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  FAILED
+}
+
+enum MsgEvent {
+  CONFIRMATION_CANDIDATURE
+  MEDIA_A_REFAIRE
+  EN_COURS_ETUDE
+  PRESELECTION
+  ENTRETIEN
+  REFUS
+  CLOTURE
+  RAPPEL_ENTREPRISE
+  RAPPEL_CANDIDAT
+  ACCES_COMPTE
+}
+
+enum InvoiceStatus {
+  PAYEE
+  EN_ATTENTE
+  EN_RETARD
+}
+
+// ==================== RÉFÉRENTIELS ====================
+
+model Wilaya {
+  code   Int    @id // 1..58
+  nameFr String
+  nameAr String
+
+  companies    Company[]
+  jobs         Job[]
+}
+
+model Sector {
+  id      Int     @id @default(autoincrement())
+  labelFr String
+  labelAr String?
+  labelEn String?
+  active  Boolean @default(true)
+
+  companies Company[]
+  jobs      Job[]
+}
+
+// ==================== IDENTITÉ & ACCÈS (ton domaine) ====================
+
+model StaffUser {
+  id       String    @id @default(cuid())
+  email    String    @unique
+  password String // bcrypt — comme ton code actuel
+  name     String
+  role     StaffRole @default(OPERATIONS)
+  isActive Boolean   @default(true)
 
   passwordResetCode    String?
   passwordResetExpires DateTime?
 
-  refreshTokens RefreshToken[]
+  refreshTokens     RefreshToken[]
+  createdCompanies  Company[]         @relation("CompanyCreatedBy")
+  createdUsers      CompanyUser[]     @relation("AccountCreatedBy")
+  reviewedDocuments CompanyDocument[]
+  assignedLeads     Lead[]
+  leadNotes         LeadNote[]
+  moderationActions MediaModerationLog[]
+  reviewedRequests  JobChangeRequest[]
+  createdInvoices   Invoice[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
 
+model CompanyUser {
+  id       String @id @default(cuid())
+  email    String @unique
+  password String
+  name     String
+
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId String
+
+  // Onboarding (section 14) — remplace ton flow emailVerification :
+  // c'est l'admin qui initie, pas l'utilisateur
+  mustChangePassword Boolean   @default(true)
+  activationToken    String?   @unique // HASH du token, jamais en clair
+  activationExpires  DateTime? // 72 h, régénérable par un ADMIN
+
+  // Verrouillage (19.1)
+  failedAttempts Int       @default(0)
+  lockedUntil    DateTime?
+
+  passwordResetCode    String?
+  passwordResetExpires DateTime?
+
+  isActive    Boolean   @default(true)
+  lastLoginAt DateTime?
+
+  createdByStaff StaffUser? @relation("AccountCreatedBy", fields: [createdBy], references: [id])
+  createdBy      String?
+
+  refreshTokens     RefreshToken[]
+  jobChangeRequests JobChangeRequest[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([companyId])
+}
+
+// Ton modèle, étendu : un token appartient à exactement UNE des deux
+// populations (à valider dans le service)
 model RefreshToken {
   id          String   @id @default(cuid())
   hashedToken String
-  userId      String
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   expiresAt   DateTime
   revoked     Boolean  @default(false)
-  createdAt   DateTime @default(now())
 
-  @@index([userId])
+  companyUser   CompanyUser? @relation(fields: [companyUserId], references: [id], onDelete: Cascade)
+  companyUserId String?
+  staffUser     StaffUser?   @relation(fields: [staffUserId], references: [id], onDelete: Cascade)
+  staffUserId   String?
+
+  createdAt DateTime @default(now())
+
+  @@index([companyUserId])
+  @@index([staffUserId])
+}
+
+// ==================== ENTREPRISES ====================
+
+model Company {
+  id          String  @id @default(cuid())
+  slug        String  @unique
+  name        String
+  sector      Sector? @relation(fields: [sectorId], references: [id])
+  sectorId    Int?
+  city        String?
+  wilaya      Wilaya? @relation(fields: [wilayaCode], references: [code])
+  wilayaCode  Int?
+  address     String?
+  phone       String?
+  whatsapp    String?
+  website     String?
+  logoUrl     String?
+  description String?
+  culture     String?
+  valuesTags  String[] @default([])
+  socials     Json     @default("{}")
+
+  verification CompanyVerification @default(A_VERIFIER)
+  isCertified  Boolean             @default(false)
+  isActive     Boolean             @default(false) // activée après validation seulement
+  billingInfo  Json                @default("{}")
+
+  createdByStaff StaffUser? @relation("CompanyCreatedBy", fields: [createdBy], references: [id])
+  createdBy      String?
+
+  users     CompanyUser[]
+  documents CompanyDocument[]
+  leads     Lead[]
+  jobs      Job[]
+  invoices  Invoice[]
+  packs     Pack[]
+  messages  Message[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model CompanyDocument {
+  id        String         @id @default(cuid())
+  company   Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId String
+  docType   String
+  filePath  String // bucket privé
+  status    DocumentStatus @default(RECU)
+
+  reviewedBy StaffUser? @relation(fields: [reviewerId], references: [id])
+  reviewerId String?
+  reviewedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId])
+}
+
+model Lead {
+  id          String     @id @default(cuid())
+  companyName String
+  contactName String
+  email       String?
+  phone       String?
+  whatsapp    String?
+  message     String?
+  source      LeadSource @default(FORMULAIRE)
+  status      LeadStatus @default(NOUVEAU)
+
+  closer   StaffUser? @relation(fields: [closerId], references: [id])
+  closerId String?
+
+  convertedCompany   Company? @relation(fields: [convertedCompanyId], references: [id])
+  convertedCompanyId String?
+
+  notes LeadNote[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model LeadNote {
+  id       String     @id @default(cuid())
+  lead     Lead       @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  leadId   String
+  author   StaffUser? @relation(fields: [authorId], references: [id])
+  authorId String?
+  note     String
+
+  createdAt DateTime @default(now())
+
+  @@index([leadId])
+}
+
+// ==================== OFFRES ====================
+
+model Job {
+  id        String  @id @default(cuid())
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId String
+  slug      String  @unique
+
+  title       String
+  isAnonymous Boolean      @default(false) // "Entreprise confidentielle"
+  contract    ContractType
+  mode        WorkMode     @default(PRESENTIEL)
+  city        String?
+  wilaya      Wilaya?      @relation(fields: [wilayaCode], references: [code])
+  wilayaCode  Int?
+  addressZone String?
+
+  salaryMin  Int?
+  salaryMax  Int?
+  currency   Currency @default(DZD)
+  showSalary Boolean  @default(true)
+
+  description String?
+  missions    String[] @default([])
+  profile     String[] @default([])
+  skills      String[] @default([])
+  experience  ExperienceLevel?
+  education   EducationLevel   @default(NON_REQUIS)
+  languages   String[] @default([])
+  schedule    String?
+  benefits    String[] @default([])
+  sector      Sector?  @relation(fields: [sectorId], references: [id])
+  sectorId    Int?
+  lang        Lang     @default(FR) // pilote la langue des contenus
+
+  // Le CV est toujours obligatoire ; audio/vidéo au choix de l'entreprise (3.3)
+  mediaAudio MediaRequirement @default(OFF)
+  mediaVideo MediaRequirement @default(OFF)
+
+  // L'entreprise exprime un souhait ; OMPLEO fixe les dates réelles (13)
+  desiredDelay       String?
+  publishAt          DateTime?
+  closesAt           DateTime?
+  decisionDeadlineAt DateTime? // garde-fou post-clôture (13.4)
+
+  status        JobStatus @default(BROUILLON)
+  isFeatured    Boolean   @default(false)
+  reviewComment String? // commentaires "à compléter"
+  closedAt      DateTime?
+  archivedAt    DateTime?
+
+  events         JobEvent[]
+  changeRequests JobChangeRequest[]
+  applications   Application[]
+  invoiceLines   InvoiceLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, publishAt(sort: Desc)])
+  @@index([wilayaCode, contract, sectorId])
+  @@index([closesAt])
+  @@index([companyId])
+}
+
+model JobEvent {
+  id         BigInt     @id @default(autoincrement())
+  job        Job        @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId      String
+  fromStatus JobStatus?
+  toStatus   JobStatus
+  actorType  String // 'company' | 'staff' | 'system'
+  actorId    String?
+  comment    String? // motifs internes journalisés (17.5)
+  createdAt  DateTime   @default(now())
+
+  @@index([jobId])
+}
+
+model JobChangeRequest {
+  id      String           @id @default(cuid())
+  job     Job              @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId   String
+  type    JobRequestType
+  payload Json             @default("{}")
+  message String?
+  status  JobRequestStatus @default(EN_ATTENTE)
+
+  requestedBy   CompanyUser? @relation(fields: [requesterId], references: [id])
+  requesterId   String?
+  reviewedBy    StaffUser?   @relation(fields: [reviewerId], references: [id])
+  reviewerId    String?
+  reviewedAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([jobId])
+}
+
+// ==================== CANDIDATURES (sans compte) ====================
+
+model Application {
+  id    String @id @default(cuid())
+  job   Job    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId String
+
+  firstName String
+  lastName  String
+  whatsapp  String // E.164 +213…
+  email     String
+  city      String // ajouté en V2 (9.1)
+  message   String? // ≤ 500 — valider en DTO
+  consentAt DateTime // consentement explicite horodaté (19.1)
+
+  status ApplicationStatus @default(A_ETUDIER)
+  lang   Lang              @default(FR) // langue des messages au candidat
+
+  ipHash String?
+
+  events    ApplicationEvent[]
+  notes     ApplicationNote[]
+  media     ApplicationMedia[]
+  redoLinks MediaRedoLink[]
+  aiDossier AiDossier?
+  messages  Message[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Déduplication serveur (R02) — email en lowercase à normaliser en DTO
+  @@unique([jobId, email, whatsapp])
+  @@index([jobId, createdAt(sort: Desc)])
+  @@index([status])
+}
+
+model ApplicationEvent {
+  id            BigInt             @id @default(autoincrement())
+  application   Application        @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  applicationId String
+  fromStatus    ApplicationStatus?
+  toStatus      ApplicationStatus
+  actorType     String // 'company' | 'staff' | 'system'
+  actorId       String?
+  createdAt     DateTime           @default(now())
+
+  @@index([applicationId])
+}
+
+model ApplicationNote {
+  id            String      @id @default(cuid())
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  applicationId String
+  authorType    String // 'company' | 'staff'
+  authorId      String?
+  note          String
+  createdAt     DateTime    @default(now())
+
+  @@index([applicationId])
+}
+
+// ==================== MÉDIAS & MODÉRATION (section 12) ====================
+
+model ApplicationMedia {
+  id            String      @id @default(cuid())
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  applicationId String
+  kind          MediaKind
+  version       Int         @default(1)
+  filePath      String? // bucket privé, JAMAIS public (19.1)
+  mimeType      String?
+  sizeBytes     Int?
+  durationS     Int?
+  status        MediaStatus @default(A_ENVOYER)
+  aiChecks      Json        @default("{}") // résultats détaillés 12.1/12.2
+  blockReason   String? // visible Ompleo uniquement, JAMAIS entreprise
+  isCurrent     Boolean     @default(true)
+
+  moderationLog MediaModerationLog[]
+
+  createdAt  DateTime  @default(now())
+  analyzedAt DateTime?
+
+  // RÈGLE R06 : côté entreprise, ne servir QUE status=VALIDE && isCurrent
+  @@index([applicationId, kind])
+  @@index([status])
+}
+
+model MediaModerationLog {
+  id         BigInt           @id @default(autoincrement())
+  media      ApplicationMedia @relation(fields: [mediaId], references: [id], onDelete: Cascade)
+  mediaId    String
+  fromStatus MediaStatus?
+  toStatus   MediaStatus
+  reason     String?
+  operator   StaffUser?       @relation(fields: [operatorId], references: [id])
+  operatorId String? // NULL = pipeline IA
+  createdAt  DateTime         @default(now())
+
+  @@index([mediaId])
+}
+
+model MediaRedoLink {
+  id            String      @id @default(cuid())
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  applicationId String
+  kind          MediaKind
+  tokenHash     String      @unique // jamais le token en clair
+  expiresAt     DateTime // min(usage, clôture de l'offre)
+  usedAt        DateTime?
+  createdAt     DateTime    @default(now())
+}
+
+// ==================== ANALYSE IA (15.7) — SANS score, SANS reco ====================
+
+model AiDossier {
+  application   Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+  applicationId String      @id
+
+  cvSummary        String?
+  experiences      String[] @default([])
+  detectedSkills   String[] @default([])
+  languages        String[] @default([])
+  matchingElements String[] @default([]) // "Éléments correspondant à l'offre"
+  toVerify         String[] @default([]) // "Éléments à vérifier"
+  missingInfo      String[] @default([])
+  audioTranscript  String?
+  audioSummary     String?
+  videoSummary     String?
+  model            String?
+  status           String   @default("queued") // queued|processing|done|failed
+  error            String?
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  // INTERDIT (R24) : aucun champ score / recommendation.
+}
+
+// ==================== MESSAGES (17.8, 18) ====================
+
+model MessageTemplate {
+  id      String     @id @default(cuid())
+  event   MsgEvent
+  channel MsgChannel
+  lang    Lang
+  subject String? // email uniquement
+  body    String // variables [Prénom] [Poste] [Entreprise] [date] [lien] [N]
+  active  Boolean    @default(true)
+
+  messages Message[]
+
+  @@unique([event, channel, lang])
+}
+
+model Message {
+  id      String     @id @default(cuid())
+  event   MsgEvent
+  channel MsgChannel
+  lang    Lang
+
+  application   Application? @relation(fields: [applicationId], references: [id], onDelete: SetNull)
+  applicationId String?
+  company       Company?     @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  companyId     String? // rappels entreprise
+
+  recipient     String // numéro ou email
+  body          String // message rendu
+  template      MessageTemplate? @relation(fields: [templateId], references: [id])
+  templateId    String?
+  status        MsgStatus        @default(QUEUED)
+  providerMsgId String?
+  error         String?
+
+  queuedAt    DateTime  @default(now())
+  sentAt      DateTime?
+  deliveredAt DateTime?
+
+  @@index([applicationId])
+  @@index([status])
+}
+
+// ==================== FACTURATION CONSULTATIVE (16) ====================
+
+model Pack {
+  id             String   @id @default(cuid())
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId      String
+  label          String
+  offersIncluded Int?
+  offersUsed     Int      @default(0)
+  startsAt       DateTime?
+  endsAt         DateTime?
+
+  invoiceLines InvoiceLine[]
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId])
+}
+
+model Invoice {
+  id        String        @id @default(cuid())
+  company   Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  companyId String
+  number    String        @unique
+  issuedOn  DateTime
+  dueOn     DateTime?
+  amount    Decimal       @db.Decimal(12, 2)
+  currency  Currency      @default(DZD)
+  status    InvoiceStatus @default(EN_ATTENTE)
+  pdfPath   String? // bucket privé
+
+  createdByStaff StaffUser? @relation(fields: [createdBy], references: [id])
+  createdBy      String?
+
+  lines InvoiceLine[]
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId])
+}
+
+model InvoiceLine {
+  id        BigInt  @id @default(autoincrement())
+  invoice   Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  invoiceId String
+  label     String
+  amount    Decimal @db.Decimal(12, 2)
+  job       Job?    @relation(fields: [jobId], references: [id])
+  jobId     String?
+  pack      Pack?   @relation(fields: [packId], references: [id])
+  packId    String?
+}
+
+// ==================== MINI-CMS (11, 17.9) ====================
+
+model CmsContent {
+  id          String   @id @default(cuid())
+  groupKey    String // regroupe les versions FR/AR/EN d'un même contenu
+  lang        Lang
+  kind        String // video | reel | youtube | faq | audio_exemple | video_exemple
+  title       String
+  description String?
+  mediaUrl    String?
+  contexts    String[] @default([])
+  // valeurs : accueil, comment_ca_marche, aide, popup_audio, popup_video,
+  //           media_refuse, page_entreprises, footer
+  active      Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+
+  @@unique([groupKey, lang])
+}
+
+// ==================== PARAMÈTRES & JOURNAL ====================
+
+model PlatformSettings {
+  id                   Int      @id @default(1) // singleton — toujours 1
+  platformName         String   @default("OMPLEO")
+  contactEmail         String?
+  activeLanguages      Lang[]   @default([FR, AR, EN])
+  cvMaxMb              Int      @default(5)
+  audioMaxSeconds      Int      @default(60)
+  videoMaxSeconds      Int      @default(30)
+  reminderDaysBefore   Int[]    @default([7, 3, 1])
+  decisionDeadlineDays Int      @default(14)
+  aiThresholds         Json     @default("{}")
+
+  // Auth (19.1) — verrouillage CompanyUser après échecs successifs
+  loginLockoutThreshold      Int @default(5)
+  loginLockoutDurationMinutes Int @default(30)
+}
+
+model ActivityLog {
+  id         BigInt   @id @default(autoincrement())
+  actorType  String // 'staff' | 'company' | 'candidate' | 'system'
+  actorId    String?
+  action     String // 'company.created','media.blocked','cv.downloaded',...
+  entityType String?
+  entityId   String?
+  meta       Json     @default("{}")
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
 }

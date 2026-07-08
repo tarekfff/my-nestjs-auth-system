@@ -1,29 +1,29 @@
-import {
-  BadRequestException,
-  ConflictException,
-  ForbiddenException,
-  Injectable,
-  UnauthorizedException,
-} from '@nestjs/common';
+import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
-import { User } from '@prisma/client';
+import { CompanyUser, StaffUser } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
-import { randomBytes, randomInt } from 'crypto';
+import { createHash, randomBytes, randomInt } from 'crypto';
 import { PrismaService } from '../../lib/database/prisma.service';
 import { MailService } from '../../lib/mail/mail.service';
-import { UserService } from '../user/user.service';
-import { UserEntity } from '../user/entities/user.entity';
+import { AppException } from '../../common/exceptions/app.exception';
+import {
+  RequestUser,
+  UserType,
+} from '../../common/types/request-user.interface';
+import { ActivateDto } from './dto/activate.dto';
+import { ChangePasswordDto } from './dto/change-password.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { LoginDto } from './dto/login.dto';
-import { RegisterDto } from './dto/register.dto';
-import { ResendVerificationDto } from './dto/resend-verification.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
-import { VerifyEmailDto } from './dto/verify-email.dto';
-import { RefreshTokenPayload } from './types/jwt-payload.interface';
+import {
+  AccessTokenPayload,
+  RefreshTokenPayload,
+} from './types/jwt-payload.interface';
 
-const EMAIL_VERIFICATION_TTL_MS = 15 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 15 * 60 * 1000;
+const DEFAULT_LOCKOUT_THRESHOLD = 5;
+const DEFAULT_LOCKOUT_DURATION_MINUTES = 30;
 const GENERIC_MESSAGE = {
   message: 'If that account exists, an email was sent.',
 };
@@ -35,122 +35,162 @@ export interface TokenPair {
   refreshTokenExpiresAt: string;
 }
 
+interface TokenClaims {
+  sub: string;
+  userType: UserType;
+  companyId?: string;
+  role?: AccessTokenPayload['role'];
+}
+
 @Injectable()
 export class AuthService {
   constructor(
-    private readonly userService: UserService,
     private readonly jwtService: JwtService,
     private readonly mailService: MailService,
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
   ) {}
 
-  async register(
-    dto: RegisterDto,
-  ): Promise<{ user: UserEntity; message: string }> {
-    const existing = await this.userService.findByEmail(dto.email);
-    if (existing) {
-      throw new ConflictException('An account with this email already exists');
-    }
-
-    const hashedPassword = await bcrypt.hash(dto.password, 10);
-    const emailVerificationCode = this.generateOtp();
-    const emailVerificationExpires = new Date(
-      Date.now() + EMAIL_VERIFICATION_TTL_MS,
-    );
-
-    const user = await this.userService.create({
-      name: dto.name,
-      email: dto.email,
-      password: hashedPassword,
-      emailVerificationCode,
-      emailVerificationExpires,
+  async login(
+    dto: LoginDto,
+  ): Promise<TokenPair & { userType: UserType; mustChangePassword?: boolean }> {
+    const companyUser = await this.prisma.companyUser.findUnique({
+      where: { email: dto.email },
     });
 
-    await this.mailService.sendVerificationEmail(
-      user.email,
-      emailVerificationCode,
+    if (companyUser) {
+      return this.loginCompanyUser(companyUser, dto.password);
+    }
+
+    const staffUser = await this.prisma.staffUser.findUnique({
+      where: { email: dto.email },
+    });
+
+    if (staffUser) {
+      return this.loginStaffUser(staffUser, dto.password);
+    }
+
+    throw new AppException(401, 'unauthorized', 'Invalid credentials');
+  }
+
+  private async loginCompanyUser(
+    companyUser: CompanyUser,
+    password: string,
+  ): Promise<TokenPair & { userType: UserType; mustChangePassword: boolean }> {
+    if (companyUser.lockedUntil && companyUser.lockedUntil > new Date()) {
+      throw new AppException(423, 'locked', 'Account locked, try again later');
+    }
+
+    const passwordMatches = await bcrypt.compare(
+      password,
+      companyUser.password,
     );
+    if (!passwordMatches) {
+      await this.registerFailedAttempt(companyUser);
+      throw new AppException(401, 'unauthorized', 'Invalid credentials');
+    }
+
+    await this.prisma.companyUser.update({
+      where: { id: companyUser.id },
+      data: { failedAttempts: 0, lockedUntil: null, lastLoginAt: new Date() },
+    });
+
+    const tokens = await this.issueTokenPair({
+      sub: companyUser.id,
+      userType: 'COMPANY',
+      companyId: companyUser.companyId,
+    });
 
     return {
-      user: new UserEntity(user),
-      message:
-        'Account created. Enter the 6-digit code we sent to your email to verify your account.',
+      ...tokens,
+      userType: 'COMPANY',
+      mustChangePassword: companyUser.mustChangePassword,
     };
   }
 
-  async verifyEmail(dto: VerifyEmailDto): Promise<{ message: string }> {
-    const user = await this.userService.findByEmail(dto.email);
-    if (
-      !user ||
-      user.isEmailVerified ||
-      !user.emailVerificationCode ||
-      !user.emailVerificationExpires ||
-      user.emailVerificationExpires < new Date() ||
-      user.emailVerificationCode !== dto.code
-    ) {
-      throw new BadRequestException('Invalid or expired code');
+  private async loginStaffUser(
+    staffUser: StaffUser,
+    password: string,
+  ): Promise<TokenPair & { userType: UserType }> {
+    if (!staffUser.isActive) {
+      throw new AppException(401, 'unauthorized', 'Invalid credentials');
     }
 
-    await this.userService.markEmailVerified(user.id);
-    return { message: 'Email verified. You can now log in.' };
+    const passwordMatches = await bcrypt.compare(password, staffUser.password);
+    if (!passwordMatches) {
+      throw new AppException(401, 'unauthorized', 'Invalid credentials');
+    }
+
+    const tokens = await this.issueTokenPair({
+      sub: staffUser.id,
+      userType: 'STAFF',
+      role: staffUser.role,
+    });
+
+    return { ...tokens, userType: 'STAFF' };
   }
 
-  async resendVerification(
-    dto: ResendVerificationDto,
-  ): Promise<{ message: string }> {
-    const user = await this.userService.findByEmail(dto.email);
-    if (user && !user.isEmailVerified) {
-      const code = this.generateOtp();
-      const expires = new Date(Date.now() + EMAIL_VERIFICATION_TTL_MS);
-      await this.userService.setEmailVerificationCode(user.id, code, expires);
-      await this.mailService.sendVerificationEmail(user.email, code);
-    }
-    return GENERIC_MESSAGE;
-  }
+  private async registerFailedAttempt(companyUser: CompanyUser): Promise<void> {
+    const settings = await this.prisma.platformSettings.findUnique({
+      where: { id: 1 },
+    });
+    const threshold =
+      settings?.loginLockoutThreshold ?? DEFAULT_LOCKOUT_THRESHOLD;
+    const durationMinutes =
+      settings?.loginLockoutDurationMinutes ?? DEFAULT_LOCKOUT_DURATION_MINUTES;
 
-  async login(dto: LoginDto): Promise<TokenPair & { user: UserEntity }> {
-    const user = await this.userService.findByEmail(dto.email);
-    if (!user || !(await bcrypt.compare(dto.password, user.password))) {
-      throw new UnauthorizedException('Invalid credentials');
-    }
+    const failedAttempts = companyUser.failedAttempts + 1;
+    const lockedUntil =
+      failedAttempts >= threshold
+        ? new Date(Date.now() + durationMinutes * 60_000)
+        : null;
 
-    if (!user.isEmailVerified) {
-      throw new ForbiddenException('Email not verified');
-    }
-
-    const tokens = await this.issueTokenPair(user);
-    return { ...tokens, user: new UserEntity(user) };
+    await this.prisma.companyUser.update({
+      where: { id: companyUser.id },
+      data: { failedAttempts, lockedUntil },
+    });
   }
 
   async refresh(
     payload: RefreshTokenPayload,
-  ): Promise<TokenPair & { user: UserEntity }> {
+  ): Promise<TokenPair & { userType: UserType }> {
     const tokenRow = await this.prisma.refreshToken.findUnique({
       where: { id: payload.jti },
     });
 
-    if (!tokenRow || tokenRow.userId !== payload.sub) {
-      throw new UnauthorizedException('Invalid refresh token');
+    if (!tokenRow) {
+      throw new AppException(401, 'unauthorized', 'Invalid refresh token');
+    }
+
+    const ownerId =
+      payload.userType === 'COMPANY'
+        ? tokenRow.companyUserId
+        : tokenRow.staffUserId;
+    const otherId =
+      payload.userType === 'COMPANY'
+        ? tokenRow.staffUserId
+        : tokenRow.companyUserId;
+
+    if (ownerId !== payload.sub || otherId !== null) {
+      throw new AppException(401, 'unauthorized', 'Invalid refresh token');
     }
 
     if (tokenRow.revoked) {
-      await this.logoutAll(tokenRow.userId);
-      throw new UnauthorizedException('Session revoked, please log in again');
+      await this.revokeAllForUser(payload.userType, payload.sub);
+      throw new AppException(
+        401,
+        'unauthorized',
+        'Session revoked, please log in again',
+      );
     }
 
     if (tokenRow.expiresAt < new Date()) {
-      throw new UnauthorizedException('Session expired');
+      throw new AppException(401, 'unauthorized', 'Session expired');
     }
 
     const matches = await bcrypt.compare(payload.secret, tokenRow.hashedToken);
     if (!matches) {
-      throw new UnauthorizedException('Invalid refresh token');
-    }
-
-    const user = await this.userService.findById(payload.sub);
-    if (!user) {
-      throw new UnauthorizedException('Invalid refresh token');
+      throw new AppException(401, 'unauthorized', 'Invalid refresh token');
     }
 
     await this.prisma.refreshToken.update({
@@ -158,15 +198,42 @@ export class AuthService {
       data: { revoked: true },
     });
 
-    const tokens = await this.issueTokenPair(user);
-    return { ...tokens, user: new UserEntity(user) };
+    if (payload.userType === 'COMPANY') {
+      const companyUser = await this.prisma.companyUser.findUnique({
+        where: { id: payload.sub },
+      });
+      if (!companyUser || !companyUser.isActive) {
+        throw new AppException(401, 'unauthorized', 'Invalid refresh token');
+      }
+      const tokens = await this.issueTokenPair({
+        sub: companyUser.id,
+        userType: 'COMPANY',
+        companyId: companyUser.companyId,
+      });
+      return { ...tokens, userType: 'COMPANY' };
+    }
+
+    const staffUser = await this.prisma.staffUser.findUnique({
+      where: { id: payload.sub },
+    });
+    if (!staffUser || !staffUser.isActive) {
+      throw new AppException(401, 'unauthorized', 'Invalid refresh token');
+    }
+    const tokens = await this.issueTokenPair({
+      sub: staffUser.id,
+      userType: 'STAFF',
+      role: staffUser.role,
+    });
+    return { ...tokens, userType: 'STAFF' };
   }
 
   async logout(refreshToken: string): Promise<{ message: string }> {
     try {
       const payload = this.jwtService.verify<RefreshTokenPayload>(
         refreshToken,
-        { secret: this.configService.get<string>('JWT_REFRESH_SECRET') },
+        {
+          secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
+        },
       );
       await this.prisma.refreshToken.updateMany({
         where: { id: payload.jti },
@@ -178,49 +245,198 @@ export class AuthService {
     return { message: 'Logged out' };
   }
 
-  async logoutAll(userId: string): Promise<{ message: string }> {
-    await this.prisma.refreshToken.updateMany({
-      where: { userId, revoked: false },
-      data: { revoked: true },
-    });
+  async logoutAll(user: RequestUser): Promise<{ message: string }> {
+    await this.revokeAllForUser(user.userType, user.userId);
     return { message: 'All sessions revoked' };
   }
 
+  async changePassword(
+    user: RequestUser,
+    dto: ChangePasswordDto,
+  ): Promise<{ message: string }> {
+    if (user.userType === 'COMPANY') {
+      const companyUser = await this.prisma.companyUser.findUnique({
+        where: { id: user.userId },
+      });
+      if (!companyUser) {
+        throw new AppException(401, 'unauthorized', 'Invalid session');
+      }
+      const matches = await bcrypt.compare(
+        dto.currentPassword,
+        companyUser.password,
+      );
+      if (!matches) {
+        throw new AppException(401, 'unauthorized', 'Invalid credentials');
+      }
+      const hashedPassword = await bcrypt.hash(dto.newPassword, 10);
+      await this.prisma.companyUser.update({
+        where: { id: companyUser.id },
+        data: { password: hashedPassword, mustChangePassword: false },
+      });
+      return { message: 'Password changed successfully' };
+    }
+
+    const staffUser = await this.prisma.staffUser.findUnique({
+      where: { id: user.userId },
+    });
+    if (!staffUser) {
+      throw new AppException(401, 'unauthorized', 'Invalid session');
+    }
+    const matches = await bcrypt.compare(
+      dto.currentPassword,
+      staffUser.password,
+    );
+    if (!matches) {
+      throw new AppException(401, 'unauthorized', 'Invalid credentials');
+    }
+    const hashedPassword = await bcrypt.hash(dto.newPassword, 10);
+    await this.prisma.staffUser.update({
+      where: { id: staffUser.id },
+      data: { password: hashedPassword },
+    });
+    return { message: 'Password changed successfully' };
+  }
+
+  async activate(dto: ActivateDto): Promise<{ message: string }> {
+    const tokenHash = createHash('sha256').update(dto.token).digest('hex');
+    const companyUser = await this.prisma.companyUser.findUnique({
+      where: { activationToken: tokenHash },
+    });
+
+    if (
+      !companyUser ||
+      !companyUser.activationExpires ||
+      companyUser.activationExpires < new Date()
+    ) {
+      throw new AppException(
+        400,
+        'invalid_request',
+        'Invalid or expired activation token',
+      );
+    }
+
+    const hashedPassword = await bcrypt.hash(dto.newPassword, 10);
+    await this.prisma.companyUser.update({
+      where: { id: companyUser.id },
+      data: {
+        password: hashedPassword,
+        activationToken: null,
+        activationExpires: null,
+        mustChangePassword: false,
+        isActive: true,
+        failedAttempts: 0,
+        lockedUntil: null,
+      },
+    });
+
+    return { message: 'Account activated' };
+  }
+
   async forgotPassword(dto: ForgotPasswordDto): Promise<{ message: string }> {
-    const user = await this.userService.findByEmail(dto.email);
-    if (user) {
+    const companyUser = await this.prisma.companyUser.findUnique({
+      where: { email: dto.email },
+    });
+    if (companyUser) {
       const code = this.generateOtp();
       const expires = new Date(Date.now() + PASSWORD_RESET_TTL_MS);
-      await this.userService.setPasswordResetCode(user.id, code, expires);
-      await this.mailService.sendPasswordResetEmail(user.email, code);
+      await this.prisma.companyUser.update({
+        where: { id: companyUser.id },
+        data: { passwordResetCode: code, passwordResetExpires: expires },
+      });
+      await this.mailService.sendPasswordResetEmail(companyUser.email, code);
+      return GENERIC_MESSAGE;
     }
+
+    const staffUser = await this.prisma.staffUser.findUnique({
+      where: { email: dto.email },
+    });
+    if (staffUser) {
+      const code = this.generateOtp();
+      const expires = new Date(Date.now() + PASSWORD_RESET_TTL_MS);
+      await this.prisma.staffUser.update({
+        where: { id: staffUser.id },
+        data: { passwordResetCode: code, passwordResetExpires: expires },
+      });
+      await this.mailService.sendPasswordResetEmail(staffUser.email, code);
+    }
+
     return GENERIC_MESSAGE;
   }
 
   async resetPassword(dto: ResetPasswordDto): Promise<{ message: string }> {
-    const user = await this.userService.findByEmail(dto.email);
-    if (
-      !user ||
-      !user.passwordResetCode ||
-      !user.passwordResetExpires ||
-      user.passwordResetExpires < new Date() ||
-      user.passwordResetCode !== dto.code
-    ) {
-      throw new BadRequestException('Invalid or expired code');
+    const companyUser = await this.prisma.companyUser.findUnique({
+      where: { email: dto.email },
+    });
+    if (companyUser && this.isResetCodeValid(companyUser, dto.code)) {
+      const hashedPassword = await bcrypt.hash(dto.newPassword, 10);
+      await this.prisma.companyUser.update({
+        where: { id: companyUser.id },
+        data: {
+          password: hashedPassword,
+          passwordResetCode: null,
+          passwordResetExpires: null,
+          failedAttempts: 0,
+          lockedUntil: null,
+        },
+      });
+      await this.revokeAllForUser('COMPANY', companyUser.id);
+      return { message: 'Password reset successfully' };
     }
 
-    const hashedPassword = await bcrypt.hash(dto.newPassword, 10);
-    await this.userService.updatePassword(user.id, hashedPassword);
-    await this.logoutAll(user.id);
+    const staffUser = await this.prisma.staffUser.findUnique({
+      where: { email: dto.email },
+    });
+    if (staffUser && this.isResetCodeValid(staffUser, dto.code)) {
+      const hashedPassword = await bcrypt.hash(dto.newPassword, 10);
+      await this.prisma.staffUser.update({
+        where: { id: staffUser.id },
+        data: {
+          password: hashedPassword,
+          passwordResetCode: null,
+          passwordResetExpires: null,
+        },
+      });
+      await this.revokeAllForUser('STAFF', staffUser.id);
+      return { message: 'Password reset successfully' };
+    }
 
-    return { message: 'Password reset successfully' };
+    throw new AppException(400, 'invalid_request', 'Invalid or expired code');
+  }
+
+  private isResetCodeValid(
+    user: {
+      passwordResetCode: string | null;
+      passwordResetExpires: Date | null;
+    },
+    code: string,
+  ): boolean {
+    return (
+      !!user.passwordResetCode &&
+      !!user.passwordResetExpires &&
+      user.passwordResetExpires > new Date() &&
+      user.passwordResetCode === code
+    );
+  }
+
+  private async revokeAllForUser(
+    userType: UserType,
+    id: string,
+  ): Promise<void> {
+    const where =
+      userType === 'COMPANY'
+        ? { companyUserId: id, revoked: false }
+        : { staffUserId: id, revoked: false };
+    await this.prisma.refreshToken.updateMany({
+      where,
+      data: { revoked: true },
+    });
   }
 
   private generateOtp(): string {
     return randomInt(0, 1_000_000).toString().padStart(6, '0');
   }
 
-  private async issueTokenPair(user: User): Promise<TokenPair> {
+  private async issueTokenPair(claims: TokenClaims): Promise<TokenPair> {
     const secret = randomBytes(32).toString('hex');
     const hashedToken = await bcrypt.hash(secret, 10);
     const refreshExpiresInMs = this.parseExpiresInMs(
@@ -235,27 +451,36 @@ export class AuthService {
 
     const tokenRow = await this.prisma.refreshToken.create({
       data: {
-        userId: user.id,
         hashedToken,
         expiresAt: refreshTokenExpiresAt,
+        companyUserId: claims.userType === 'COMPANY' ? claims.sub : undefined,
+        staffUserId: claims.userType === 'STAFF' ? claims.sub : undefined,
       },
     });
 
-    const accessToken = this.jwtService.sign(
-      { sub: user.id, role: user.role },
-      {
-        secret: this.configService.get<string>('JWT_ACCESS_SECRET'),
-        expiresIn: Math.floor(accessExpiresInMs / 1000),
-      },
-    );
+    const accessPayload: AccessTokenPayload = {
+      sub: claims.sub,
+      userType: claims.userType,
+      ...(claims.companyId ? { companyId: claims.companyId } : {}),
+      ...(claims.role ? { role: claims.role } : {}),
+    };
 
-    const refreshToken = this.jwtService.sign(
-      { sub: user.id, jti: tokenRow.id, secret },
-      {
-        secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
-        expiresIn: Math.floor(refreshExpiresInMs / 1000),
-      },
-    );
+    const accessToken = this.jwtService.sign(accessPayload, {
+      secret: this.configService.get<string>('JWT_ACCESS_SECRET'),
+      expiresIn: Math.floor(accessExpiresInMs / 1000),
+    });
+
+    const refreshPayload: RefreshTokenPayload = {
+      sub: claims.sub,
+      userType: claims.userType,
+      jti: tokenRow.id,
+      secret,
+    };
+
+    const refreshToken = this.jwtService.sign(refreshPayload, {
+      secret: this.configService.get<string>('JWT_REFRESH_SECRET'),
+      expiresIn: Math.floor(refreshExpiresInMs / 1000),
+    });
 
     return {
       accessToken,

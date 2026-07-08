@@ -2,12 +2,17 @@ import { NestFactory, Reflector } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { TransformInterceptor } from './utils/transform.interceptor';
 import { ValidationPipe } from '@nestjs/common';
-import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
+import { TokenAuthGuard } from './common/guards/token-auth.guard';
+import { MustChangePasswordGuard } from './common/guards/must-change-password.guard';
+import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import { PrismaService } from './lib/database/prisma.service';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { ThrottlerGuard } from '@nestjs/throttler';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+
+  app.setGlobalPrefix('api');
 
   app.useGlobalPipes(
     new ValidationPipe({
@@ -17,19 +22,22 @@ async function bootstrap() {
     }),
   );
 
+  app.useGlobalFilters(new AllExceptionsFilter());
   app.useGlobalInterceptors(new TransformInterceptor());
 
+  const reflector = app.get(Reflector);
   app.useGlobalGuards(
     app.get(ThrottlerGuard),
-    new JwtAuthGuard(app.get(Reflector)),
+    new TokenAuthGuard(reflector),
+    new MustChangePasswordGuard(reflector, app.get(PrismaService)),
   );
 
   app.enableShutdownHooks();
 
   const swaggerConfig = new DocumentBuilder()
-    .setTitle('Auth System API')
+    .setTitle('Ompleo Auth API')
     .setDescription(
-      'JWT authentication API: register, email verification, login, refresh-token rotation, password reset, and role-based access control.',
+      'Two-population JWT auth: CompanyUser + StaffUser, refresh rotation, lockout, activation, password reset.',
     )
     .setVersion('1.0')
     .addBearerAuth({ type: 'http', scheme: 'bearer', bearerFormat: 'JWT' })
